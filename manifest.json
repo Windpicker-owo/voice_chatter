@@ -1,0 +1,29 @@
+{
+    "name": "voice_chatter",
+    "version": "1.0.0",
+    "description": "ASR 实时语音通话专用 Chatter",
+    "author": "MoFox Team",
+    "dependencies": {
+        "plugins": ["asr_adapter", "tts_http_server"],
+        "components": []
+    },
+    "include": [
+        {
+            "component_type": "chatter",
+            "component_name": "voice_chatter",
+            "dependencies": ["asr_adapter:adapter:asr_adapter"]
+        },
+        {
+            "component_type": "action",
+            "component_name": "say",
+            "dependencies": ["asr_adapter:adapter:asr_adapter"]
+        },
+        {
+            "component_type": "action",
+            "component_name": "pass_and_wait",
+            "dependencies": []
+        }
+    ],
+    "entry_point": "plugin.py",
+    "min_core_version": "1.0.0"
+}
