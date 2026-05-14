@@ -1,6 +1,6 @@
 {
     "name": "voice_chatter",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "ASR 实时语音通话专用 Chatter",
     "author": "MoFox Team",
     "dependencies": {
@@ -32,7 +32,7 @@
         }
     ],
     "entry_point": "plugin.py",
-    "min_core_version": "1.0.0",
+    "min_core_version": "1.2.0",
     "categories": [
         "chat"
     ],
