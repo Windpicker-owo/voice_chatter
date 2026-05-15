@@ -1,5 +1,6 @@
 {
     "name": "voice_chatter",
+    "display_name": "语音通话专用聊天器",
     "version": "1.0.2",
     "description": "ASR 实时语音通话专用 Chatter",
     "author": "MoFox Team",
