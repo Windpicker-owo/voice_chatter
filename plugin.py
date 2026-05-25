@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 from typing import Annotated, Any, AsyncGenerator
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.api.service_api import get_service
 from src.core.components.base import BaseChatter, BasePlugin, Failure, Success, Wait, WaitResumeEvent
 from src.core.components.base.action import BaseAction
 from src.core.components.loader import register_plugin
@@ -14,18 +16,37 @@ from src.core.config import get_core_config
 from src.core.models.stream import ChatStream
 from src.core.prompt import get_prompt_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry
-from src.kernel.llm.payload.tooling import LLMUsable
 
 from .config import SherpaOnnxVoiceChatterConfig
 from .markers import parse_speech_segments
 from .prompt_builder import SYSTEM_PROMPT, USER_PROMPT, VoiceChatterPromptBuilder
-from .runner import run_voice_conversation
 from .tts import build_tts_backend, synthesize_segments
 
 
 logger = get_logger("voice_chatter")
 
 _PASS_AND_WAIT = "action-pass_and_wait"
+_DISABLED_STOP_CALL_NAME = "__voice_chatter_stop_disabled__"
+_VOICE_SUSPEND_TEXT = "（语音回合已挂起，等待用户继续说话。）"
+_PLAIN_TEXT_REMINDER = (
+    "系统提醒：当前是实时语音通话 Chatter。你必须调用 say action 输出要说的话，"
+    "纯文本不会被播放。说完等待用户时，请调用 pass_and_wait。"
+)
+
+
+@dataclass(slots=True)
+class _VoiceChatCoreOptions:
+    actor_task_name: str = "actor"
+    sub_actor_task_name: str = "actor"
+    enable_cooldown: bool = False
+    enable_action_suspend: bool = True
+    enable_programmatic_controller: bool = False
+    enable_sub_agent_collaboration: bool = False
+    enable_stop_direct_message_wake: bool = False
+    stop_direct_message_wake_probability: float = 0.0
+    native_multimodal: bool = False
+    theme_guide: dict[str, str] = field(default_factory=dict)
+    negative_behavior_reinforcement: bool = True
 
 
 class SayAction(BaseAction):
@@ -120,7 +141,10 @@ class SherpaOnnxVoiceChatter(BaseChatter):
     chatter_description = "sherpa-onnx ASR 实时语音通话专用 Chatter"
     associated_platforms = ["local_asr"]
     chat_type = ChatType.PRIVATE
-    dependencies = ["asr_adapter:adapter:asr_adapter"]
+    dependencies = [
+        "asr_adapter:adapter:asr_adapter",
+        "default_chatter:service:chat_core",
+    ]
     stream_tick_interval = 0.1
     allow_message_buffer = False
 
@@ -151,6 +175,11 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         """构建历史消息文本。"""
 
         return VoiceChatterPromptBuilder.build_history_text(chat_stream, self.format_message_line)
+
+    def _build_enhanced_history_text(self, chat_stream: ChatStream) -> str:
+        """DFC session 兼容的历史构建入口。"""
+
+        return self._build_history_text(chat_stream)
 
     async def _build_user_prompt(
         self,
@@ -185,6 +214,64 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         """向当前 LLM 上下文追加 USER 文本。"""
 
         response.add_payload(LLMPayload(ROLE.USER, Text(text)))
+
+    @staticmethod
+    def _upsert_pending_unread_payload(
+        response: Any,
+        formatted_text: str,
+        unread_msgs: list[Any] | None = None,
+        native_multimodal: bool = False,
+        logger_override: Any = None,
+    ) -> None:
+        """语音 Chatter 仅注入文本 unread，不启用多模态合并。"""
+
+        _ = unread_msgs, native_multimodal, logger_override
+        SherpaOnnxVoiceChatter._append_user_payload(response, formatted_text)
+
+    async def sub_agent(
+        self,
+        unreads_text: str,
+        unread_msgs: list[Any],
+        chat_stream: ChatStream,
+    ) -> dict[str, Any]:
+        """语音 Chatter 不启用 sub-agent，始终直接响应。"""
+
+        _ = unreads_text, unread_msgs, chat_stream
+        return {
+            "reason": "voice_chatter does not use sub-agent collaboration",
+            "should_respond": True,
+        }
+
+    def handle_plain_text_response(
+        self,
+        *,
+        message: str,
+        retry_count: int,
+        response: Any,
+    ) -> dict[str, str]:
+        """当模型误输出纯文本时，先提醒改用 say，再退回等待。"""
+
+        _ = message, response
+        plugin_config = self._get_plugin_config()
+        retry_limit = 1 if plugin_config is None else int(plugin_config.plugin.plain_text_retry_limit)
+        if retry_count < max(0, retry_limit):
+            return {
+                "action": "retry",
+                "reminder_text": _PLAIN_TEXT_REMINDER,
+            }
+        return {
+            "action": "wait",
+            "reminder_text": "",
+        }
+
+    def _build_chat_core_options(self) -> _VoiceChatCoreOptions:
+        """构造 voice_chatter 使用的 DFC session 选项。"""
+
+        plugin_config = self._get_plugin_config()
+        return _VoiceChatCoreOptions(
+            enable_action_suspend=plugin_config is None
+            or bool(plugin_config.plugin.enable_action_suspend),
+        )
 
     async def inject_usables(self, request: Any) -> ToolRegistry:
         """注入语音 Chatter 可用工具，排除 stop/send_text/sub-agent 管理工具。"""
@@ -224,16 +311,25 @@ class SherpaOnnxVoiceChatter(BaseChatter):
             return
 
         self.apply_stream_runtime_options(chat_stream)
-        plugin_config = self._get_plugin_config()
-        retry_limit = 1 if plugin_config is None else int(plugin_config.plugin.plain_text_retry_limit)
+        chat_core_service = get_service("default_chatter:service:chat_core")
+        if chat_core_service is None:
+            logger.error("无法获取 default_chatter:service:chat_core")
+            yield Failure("无法获取 default_chatter:service:chat_core")
+            return
 
-        runner = run_voice_conversation(
+        session = chat_core_service.create_default_session(
+            stream_id=self.stream_id,
+            plugin=self.plugin,
             chatter=self,
-            chat_stream=chat_stream,
-            logger=logger,
-            pass_call_name=_PASS_AND_WAIT,
-            plain_text_retry_limit=max(0, retry_limit),
-            enable_action_suspend=self._is_action_suspend_enabled(),
+            options=self._build_chat_core_options(),
+        )
+        session.pass_call_name = _PASS_AND_WAIT
+        session.stop_call_name = _DISABLED_STOP_CALL_NAME
+        session.suspend_text = _VOICE_SUSPEND_TEXT
+
+        runner = session.execute_with_stream(
+            chat_stream,
+            apply_stop_wake_config=False,
         )
         resume_event: WaitResumeEvent | None = None
         while True:
@@ -252,7 +348,10 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
     plugin_version = "1.0.0"
     plugin_description = "sherpa-onnx ASR 实时语音通话专用 Chatter"
     configs = [SherpaOnnxVoiceChatterConfig]
-    dependent_components = ["asr_adapter:adapter:asr_adapter"]
+    dependent_components = [
+        "asr_adapter:adapter:asr_adapter",
+        "default_chatter:service:chat_core",
+    ]
 
     async def on_plugin_loaded(self) -> None:
         """注册语音 Chatter 提示词模板。"""
