@@ -1,4 +1,4 @@
-"""sherpa-onnx 语音 Chatter 配置。"""
+"""语音 Chatter 配置。"""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ from typing import ClassVar
 from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
 
 
-class SherpaOnnxVoiceChatterConfig(BaseConfig):
-    """sherpa-onnx 语音 Chatter 配置。"""
+class VoiceChatterConfig(BaseConfig):
+    """语音 Chatter 配置。"""
 
     config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = "sherpa-onnx 语音 Chatter 配置"
+    config_description: ClassVar[str] = "语音 Chatter 配置"
 
     @config_section("plugin", title="插件设置", tag="plugin")
     class PluginSection(SectionBase):
@@ -42,5 +42,21 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
         provider: str = Field(default="qwen_tts", description="TTS provider 名称，留空则使用服务端默认 provider")
         emit_text_on_tts_failure: bool = Field(default=False, description="TTS 失败时是否回退发送文本")
 
+    @config_section("low_latency_streaming", title="Streaming", tag="low_latency_streaming")
+    class LowLatencyStreamingSection(SectionBase):
+        """低延迟流式 TTS 设置。"""
+
+        enabled: bool = Field(default=False, description="是否启用低延迟流式 TTS")
+        max_parallel_tts: int = Field(default=2, description="流式模式下的最大并行 TTS 任务数")
+        min_sentence_chars: int = Field(default=4, description="提交流式 TTS 前的最小句子长度")
+        flush_tail_on_done: bool = Field(default=True, description="工具调用流结束时是否刷新未完成的文本尾部")
+        require_native_tool_calling: bool = Field(
+            default=True,
+            description="是否需要原生工具调用支持；tool_call_compat 会自动回退",
+        )
+
     plugin: PluginSection = Field(default_factory=PluginSection)
     tts: TTSSection = Field(default_factory=TTSSection)
+    low_latency_streaming: LowLatencyStreamingSection = Field(
+        default_factory=LowLatencyStreamingSection
+    )

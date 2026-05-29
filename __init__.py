@@ -1,1 +1,1 @@
-"""sherpa-onnx ASR 实时语音通话 Chatter 插件。"""
+"""实时语音通话/直播互动 Chatter 插件。"""

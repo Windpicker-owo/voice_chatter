@@ -1,4 +1,4 @@
-"""sherpa-onnx ASR 实时语音通话专用 Chatter。"""
+"""实时语音通话/直播互动专用 Chatter。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any, AsyncGenerator
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.api.plugin_api import get_all_plugins
 from src.app.plugin_system.api.service_api import get_service
 from src.core.components.base import BaseChatter, BasePlugin, Failure, Success, Wait, WaitResumeEvent
 from src.core.components.base.action import BaseAction
@@ -15,11 +16,12 @@ from src.core.components.types import ChatType
 from src.core.config import get_core_config
 from src.core.models.stream import ChatStream
 from src.core.prompt import get_prompt_manager
-from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry
+from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
 
-from .config import SherpaOnnxVoiceChatterConfig
+from .config import VoiceChatterConfig
 from .markers import parse_speech_segments
 from .prompt_builder import SYSTEM_PROMPT, USER_PROMPT, VoiceChatterPromptBuilder
+from .streaming_observer import VoiceSayStreamObserver
 from .tts import build_tts_backend, synthesize_segments
 
 
@@ -47,6 +49,7 @@ class _VoiceChatCoreOptions:
     native_multimodal: bool = False
     theme_guide: dict[str, str] = field(default_factory=dict)
     negative_behavior_reinforcement: bool = True
+    enable_llm_stream: bool = False
 
 
 class SayAction(BaseAction):
@@ -59,7 +62,7 @@ class SayAction(BaseAction):
         "[wait] 只影响语音片段播放间隔，不会让聊天流等待；说完等待用户时请另外调用 pass_and_wait。"
     )
     chatter_allow = ["voice_chatter"]
-    associated_platforms = ["local_asr"]
+    associated_platforms = ["local_asr", "bilibili_live"]
     dependencies = ["asr_adapter:adapter:asr_adapter"]
 
     async def execute(
@@ -72,7 +75,7 @@ class SayAction(BaseAction):
         split_enabled = True
         max_parallel = 4
         empty_audio_retry_count = 1
-        if isinstance(plugin_config, SherpaOnnxVoiceChatterConfig):
+        if isinstance(plugin_config, VoiceChatterConfig):
             split_enabled = bool(plugin_config.tts.sentence_split_enabled)
             max_parallel = int(plugin_config.tts.max_parallel_segments)
             empty_audio_retry_count = int(plugin_config.tts.empty_audio_retry_count)
@@ -109,7 +112,7 @@ class SayAction(BaseAction):
 
         if success_count == 0 and failed_reasons:
             return False, f"TTS 合成失败: {failed_reasons[0]}"
-        return True, f"已提交 {success_count}/{len(segments)} 段语音到适配器播放"
+        return True, f"已排队 {success_count}/{len(segments)} 段语音到后台播放"
 
 
 class VoicePassAndWaitAction(BaseAction):
@@ -121,7 +124,7 @@ class VoicePassAndWaitAction(BaseAction):
         "seconds 为空时等待新语音输入，传入秒数时到时主动恢复。"
     )
     chatter_allow = ["voice_chatter"]
-    associated_platforms = ["local_asr"]
+    associated_platforms = ["local_asr", "bilibili_live"]
 
     async def execute(
         self,
@@ -134,13 +137,13 @@ class VoicePassAndWaitAction(BaseAction):
         return True, f"已登记等待 {seconds} 秒后继续语音通话"
 
 
-class SherpaOnnxVoiceChatter(BaseChatter):
-    """sherpa-onnx ASR 实时语音通话专用 Chatter。"""
+class VoiceChatter(BaseChatter):
+    """实时语音通话/直播互动专用 Chatter。"""
 
     chatter_name = "voice_chatter"
-    chatter_description = "sherpa-onnx ASR 实时语音通话专用 Chatter"
-    associated_platforms = ["local_asr"]
-    chat_type = ChatType.PRIVATE
+    chatter_description = "实时语音通话/直播互动专用 Chatter"
+    associated_platforms = ["local_asr", "bilibili_live"]
+    chat_type = ChatType.ALL
     dependencies = [
         "asr_adapter:adapter:asr_adapter",
         "default_chatter:service:chat_core",
@@ -148,11 +151,11 @@ class SherpaOnnxVoiceChatter(BaseChatter):
     stream_tick_interval = 0.1
     allow_message_buffer = False
 
-    def _get_plugin_config(self) -> SherpaOnnxVoiceChatterConfig | None:
+    def _get_plugin_config(self) -> VoiceChatterConfig | None:
         """返回插件配置。"""
 
         config = getattr(self.plugin, "config", None)
-        return config if isinstance(config, SherpaOnnxVoiceChatterConfig) else None
+        return config if isinstance(config, VoiceChatterConfig) else None
 
     def apply_stream_runtime_options(self, chat_stream: Any) -> None:
         """把语音通话的流运行时配置写入当前 stream。"""
@@ -169,6 +172,7 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         return await VoiceChatterPromptBuilder.build_system_prompt(
             self._get_plugin_config(),
             chat_stream,
+            voice_guide=self._build_tts_provider_voice_guide(),
         )
 
     def _build_history_text(self, chat_stream: ChatStream) -> str:
@@ -226,7 +230,7 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         """语音 Chatter 仅注入文本 unread，不启用多模态合并。"""
 
         _ = unread_msgs, native_multimodal, logger_override
-        SherpaOnnxVoiceChatter._append_user_payload(response, formatted_text)
+        VoiceChatter._append_user_payload(response, formatted_text)
 
     async def sub_agent(
         self,
@@ -264,13 +268,78 @@ class SherpaOnnxVoiceChatter(BaseChatter):
             "reminder_text": "",
         }
 
-    def _build_chat_core_options(self) -> _VoiceChatCoreOptions:
+    def _build_chat_core_options(self, *, enable_llm_stream: bool = False) -> _VoiceChatCoreOptions:
         """构造 voice_chatter 使用的 DFC session 选项。"""
 
         plugin_config = self._get_plugin_config()
         return _VoiceChatCoreOptions(
             enable_action_suspend=plugin_config is None
             or bool(plugin_config.plugin.enable_action_suspend),
+            enable_llm_stream=bool(enable_llm_stream),
+        )
+
+    def _build_tts_provider_voice_guide(self) -> str:
+        plugin_config = self._get_plugin_config()
+        provider_name = ""
+        if plugin_config is not None:
+            provider_name = str(getattr(plugin_config.tts, "provider", "") or "").strip()
+
+        candidates: list[Any] = []
+        loaded_plugins = get_all_plugins()
+
+        if provider_name:
+            provider_plugin = loaded_plugins.get(f"{provider_name}_tts_provider")
+            if provider_plugin is not None:
+                candidates.append(provider_plugin)
+
+        for plugin in loaded_plugins.values():
+            if plugin in candidates:
+                continue
+            config = getattr(plugin, "config", None)
+            plugin_section = getattr(config, "plugin", None)
+            if bool(getattr(plugin_section, "register_as_default", False)):
+                candidates.append(plugin)
+
+        guides: list[str] = []
+        for plugin in candidates:
+            config = getattr(plugin, "config", None)
+            prompt_section = getattr(config, "prompt", None)
+            if not bool(getattr(prompt_section, "inject_into_voice_chatter", False)):
+                continue
+            guide = str(getattr(prompt_section, "voice_chatter_guide", "") or "").strip()
+            if guide:
+                guides.append(guide)
+
+        return "\n\n".join(guides)
+
+    def _build_stream_observer(
+        self,
+        chat_stream: ChatStream,
+    ) -> VoiceSayStreamObserver | None:
+        plugin_config = self._get_plugin_config()
+        if plugin_config is None:
+            return None
+
+        streaming_config = getattr(plugin_config, "low_latency_streaming", None)
+        if streaming_config is None or not bool(streaming_config.enabled):
+            return None
+
+        try:
+            backend = build_tts_backend(plugin_config, logger)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Failed to initialize streaming TTS backend, fallback to normal mode: {exc}"
+            )
+            return None
+
+        return VoiceSayStreamObserver(
+            backend=backend,
+            chat_stream=chat_stream,
+            max_parallel_tts=int(getattr(streaming_config, "max_parallel_tts", 2) or 2),
+            min_sentence_chars=int(getattr(streaming_config, "min_sentence_chars", 4) or 4),
+            flush_tail_on_done=bool(getattr(streaming_config, "flush_tail_on_done", True)),
+            empty_audio_retry_count=int(plugin_config.tts.empty_audio_retry_count),
+            logger=logger,
         )
 
     async def inject_usables(self, request: Any) -> ToolRegistry:
@@ -298,6 +367,56 @@ class SherpaOnnxVoiceChatter(BaseChatter):
             request.add_payload(LLMPayload(ROLE.TOOL, registry.get_all()))  # type: ignore[arg-type]
         return registry
 
+    async def run_tool_call(
+        self,
+        calls: list[Any],
+        response: Any,
+        usable_map: ToolRegistry,
+        trigger_msg: Any,
+    ) -> list[tuple[bool, bool]]:
+        stream_observer = getattr(self, "_active_stream_observer", None)
+        preplayed_ids = (
+            set(stream_observer.preplayed_say_call_ids)
+            if stream_observer is not None
+            else set()
+        )
+        if not preplayed_ids:
+            return await super().run_tool_call(calls, response, usable_map, trigger_msg)
+
+        passthrough_calls: list[Any] = []
+        passthrough_indices: list[int] = []
+        results: list[tuple[bool, bool] | None] = [None] * len(calls)
+
+        for index, call in enumerate(calls):
+            if getattr(call, "name", "") == "action-say" and getattr(call, "id", "") in preplayed_ids:
+                response.add_payload(
+                    LLMPayload(
+                        ROLE.TOOL_RESULT,
+                        ToolResult(
+                            value="已通过流式分句提前合成并播放语音",
+                            call_id=getattr(call, "id", None),
+                            name=getattr(call, "name", ""),
+                        ),
+                    )
+                )
+                results[index] = (True, True)
+                continue
+
+            passthrough_calls.append(call)
+            passthrough_indices.append(index)
+
+        if passthrough_calls:
+            passthrough_results = await super().run_tool_call(
+                passthrough_calls,
+                response,
+                usable_map,
+                trigger_msg,
+            )
+            for index, result in zip(passthrough_indices, passthrough_results, strict=False):
+                results[index] = result
+
+        return [result if result is not None else (False, False) for result in results]
+
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure, WaitResumeEvent | None]:
         """执行语音 Chatter 主循环。"""
 
@@ -317,37 +436,46 @@ class SherpaOnnxVoiceChatter(BaseChatter):
             yield Failure("无法获取 default_chatter:service:chat_core")
             return
 
+        stream_observer = self._build_stream_observer(chat_stream)
+        enable_llm_stream = stream_observer is not None
+
         session = chat_core_service.create_default_session(
             stream_id=self.stream_id,
             plugin=self.plugin,
             chatter=self,
-            options=self._build_chat_core_options(),
+            options=self._build_chat_core_options(enable_llm_stream=enable_llm_stream),
         )
         session.pass_call_name = _PASS_AND_WAIT
         session.stop_call_name = _DISABLED_STOP_CALL_NAME
         session.suspend_text = _VOICE_SUSPEND_TEXT
+        if stream_observer is not None:
+            session.adapters.stream_event_observer = stream_observer
 
         runner = session.execute_with_stream(
             chat_stream,
             apply_stop_wake_config=False,
         )
         resume_event: WaitResumeEvent | None = None
-        while True:
-            try:
-                result = await runner.asend(resume_event)
-            except StopAsyncIteration:
-                return
-            resume_event = yield result
+        self._active_stream_observer = stream_observer
+        try:
+            while True:
+                try:
+                    result = await runner.asend(resume_event)
+                except StopAsyncIteration:
+                    return
+                resume_event = yield result
+        finally:
+            self._active_stream_observer = None
 
 
 @register_plugin
-class SherpaOnnxVoiceChatterPlugin(BasePlugin):
-    """sherpa-onnx ASR 实时语音 Chatter 插件。"""
+class VoiceChatterPlugin(BasePlugin):
+    """ASR 实时语音 Chatter 插件。"""
 
     plugin_name = "voice_chatter"
     plugin_version = "1.0.0"
-    plugin_description = "sherpa-onnx ASR 实时语音通话专用 Chatter"
-    configs = [SherpaOnnxVoiceChatterConfig]
+    plugin_description = "实时语音通话/直播互动专用 Chatter"
+    configs = [VoiceChatterConfig]
     dependent_components = [
         "asr_adapter:adapter:asr_adapter",
         "default_chatter:service:chat_core",
@@ -375,6 +503,7 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
                 "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
                 "negative_behaviors": optional("\n".join(personality.negative_behaviors)),
                 "voice_guide": optional(""),
+                "voice_call_scene": optional(""),
             },
         )
         get_prompt_manager().get_or_create(
@@ -393,12 +522,12 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
     def get_components(self) -> list[type]:
         """返回插件组件。"""
 
-        return [SherpaOnnxVoiceChatter, SayAction, VoicePassAndWaitAction]
+        return [VoiceChatter, SayAction, VoicePassAndWaitAction]
 
 
 __all__ = [
     "SayAction",
-    "SherpaOnnxVoiceChatter",
-    "SherpaOnnxVoiceChatterPlugin",
+    "VoiceChatter",
+    "VoiceChatterPlugin",
     "VoicePassAndWaitAction",
 ]

@@ -16,6 +16,8 @@ from .markers import SpeechSegment
 
 
 TTS_PROTOCOL_VERSION = "mfx-tts-http-v1"
+ASR_ADAPTER_SIGNATURE = "asr_adapter:adapter:asr_adapter"
+FORCED_LOCAL_PLAYBACK_PLATFORMS = {"bilibili_live"}
 
 
 @dataclass
@@ -151,7 +153,10 @@ class HttpTTSBackend:
             stream_id=chat_stream.stream_id,
         )
         message.extra["tts"] = tts_meta
-        return await get_message_sender().send_message(message)
+        return await get_message_sender().send_message(
+            message,
+            adapter_signature=_resolve_tts_adapter_signature(chat_stream),
+        )
 
 
 class LoggingTTSBackend:
@@ -200,6 +205,13 @@ def build_tts_backend(config: Any, logger: Logger) -> TTSBackend:
     if endpoint == "logging":
         return LoggingTTSBackend(logger, mime_type=mime_type)
     return HttpTTSBackend(endpoint=endpoint, timeout=timeout, mime_type=mime_type, provider=provider)
+
+
+def _resolve_tts_adapter_signature(chat_stream: ChatStream) -> str | None:
+    platform = str(getattr(chat_stream, "platform", "") or "").strip()
+    if platform in FORCED_LOCAL_PLAYBACK_PLATFORMS:
+        return ASR_ADAPTER_SIGNATURE
+    return None
 
 
 async def synthesize_segments(
@@ -280,6 +292,8 @@ async def _retry_empty_audio(
 
 
 __all__ = [
+    "ASR_ADAPTER_SIGNATURE",
+    "FORCED_LOCAL_PLAYBACK_PLATFORMS",
     "HttpTTSBackend",
     "LoggingTTSBackend",
     "TTSArtifact",
