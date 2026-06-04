@@ -22,7 +22,7 @@ from .config import VoiceChatterConfig
 from .markers import parse_speech_segments
 from .prompt_builder import SYSTEM_PROMPT, USER_PROMPT, VoiceChatterPromptBuilder
 from .streaming_observer import VoiceSayStreamObserver
-from .tts import build_tts_backend, synthesize_segments
+from .tts import TTSRequest, TTSArtifact, build_tts_backend
 
 
 logger = get_logger("voice_chatter")
@@ -58,8 +58,9 @@ class SayAction(BaseAction):
     action_name = "say"
     action_description = (
         "在实时语音通话中说出一段话。content 会进入 TTS 后端并由适配器播放。"
-        "支持 [wait:1] 控制下一段播放前等待 1 秒，支持 [emotion:happy]...[/emotion] 标记情绪。"
-        "[wait] 只影响语音片段播放间隔，不会让聊天流等待；说完等待用户时请另外调用 pass_and_wait。"
+        "content 会原样传给 TTS，provider 自己支持的标签可以直接写在里面；emotion 是可选情绪参数，交由 TTS provider 解释；"
+        "provider 可用于覆盖当前 TTS provider。"
+        "说完等待用户时请另外调用 pass_and_wait。"
     )
     chatter_allow = ["voice_chatter"]
     associated_platforms = ["local_asr", "bilibili_live"]
@@ -67,35 +68,72 @@ class SayAction(BaseAction):
 
     async def execute(
         self,
-        content: Annotated[str, "要通过 TTS 说出的内容，可包含 [wait:n] 和 [emotion:name] 标记"],
+        content: Annotated[str, "要通过 TTS 说出的内容，会原样传给 TTS，可直接包含 provider 支持的标签"],
+        emotion: Annotated[str | None, "可选情绪标签，交由 TTS provider 解释"] = None,
+        provider: Annotated[str | None, "可选 provider 名称；为空时使用默认 provider"] = None,
     ) -> tuple[bool, str]:
         """执行语音播放动作。"""
 
+        text = str(content or "").strip()
+        if not text:
+            return False, "语音内容不能为空"
+
         plugin_config = getattr(self.plugin, "config", None)
         split_enabled = True
-        max_parallel = 4
         empty_audio_retry_count = 1
         if isinstance(plugin_config, VoiceChatterConfig):
             split_enabled = bool(plugin_config.tts.sentence_split_enabled)
-            max_parallel = int(plugin_config.tts.max_parallel_segments)
             empty_audio_retry_count = int(plugin_config.tts.empty_audio_retry_count)
 
-        segments = parse_speech_segments(content or "", split_sentences=split_enabled)
+        segments = parse_speech_segments(
+            text,
+            split_sentences=split_enabled,
+            default_emotion=emotion,
+        )
         if not segments:
             return True, "没有可播放的语音内容"
 
         backend = build_tts_backend(plugin_config, logger)
-        artifacts = await synthesize_segments(
-            backend=backend,
-            stream_id=self.chat_stream.stream_id,
-            segments=segments,
-            max_parallel=max_parallel,
-            empty_audio_retry_count=empty_audio_retry_count,
-        )
 
-        success_count = 0
+        _SENTINEL = object()
+        queue: asyncio.Queue[tuple[float, TTSArtifact] | object] = asyncio.Queue()
         failed_reasons: list[str] = []
-        for segment, artifact in zip(segments, artifacts, strict=False):
+
+        async def emit_loop() -> int:
+            count = 0
+            while True:
+                item = await queue.get()
+                if item is _SENTINEL:
+                    break
+                wait_before, artifact = item  # type: ignore[misc]
+                if wait_before > 0:
+                    await asyncio.sleep(wait_before)
+                if await backend.emit(artifact, self.chat_stream):
+                    count += 1
+            return count
+
+        emit_task = asyncio.create_task(emit_loop())
+
+        for segment in segments:
+            request = TTSRequest(
+                stream_id=self.chat_stream.stream_id,
+                text=segment.text,
+                emotion=segment.emotion,
+                provider=provider,
+                markers=segment.markers,
+            )
+            try:
+                artifact = await backend.synthesize(request)
+            except Exception as exc:
+                failed_reasons.append(str(exc))
+                logger.error(f"TTS 合成失败，跳过播放: {segment.text} ({exc})")
+                continue
+
+            for _ in range(empty_audio_retry_count):
+                if artifact.audio:
+                    break
+                artifact = await backend.synthesize(request)
+
             error = artifact.metadata.get("error") if isinstance(artifact.metadata, dict) else None
             if error:
                 failed_reasons.append(str(error))
@@ -105,10 +143,10 @@ class SayAction(BaseAction):
                 failed_reasons.append("TTS 后端未返回音频数据")
                 logger.error(f"TTS 后端未返回音频数据，跳过播放: {segment.text}")
                 continue
-            if segment.wait_before > 0:
-                await asyncio.sleep(segment.wait_before)
-            if await backend.emit(artifact, self.chat_stream):
-                success_count += 1
+            await queue.put((segment.wait_before, artifact))
+
+        await queue.put(_SENTINEL)
+        success_count = await emit_task
 
         if success_count == 0 and failed_reasons:
             return False, f"TTS 合成失败: {failed_reasons[0]}"
@@ -121,20 +159,18 @@ class VoicePassAndWaitAction(BaseAction):
     action_name = "pass_and_wait"
     action_description = (
         "为实时语音通话登记等待点。说完话后调用它等待用户继续说话；"
-        "seconds 为空时等待新语音输入，传入秒数时到时主动恢复。"
+        "seconds 到时主动恢复。"
     )
     chatter_allow = ["voice_chatter"]
     associated_platforms = ["local_asr", "bilibili_live"]
 
     async def execute(
         self,
-        seconds: Annotated[float | None, "等待秒数；为空则等待新的用户语音输入"] = None,
+        seconds: Annotated[float, "等待秒数，考虑到延迟因素一般推荐大于15s"],
     ) -> tuple[bool, str]:
         """登记等待状态。"""
 
-        if seconds is None:
-            return True, "已登记等待新的用户语音输入"
-        return True, f"已登记等待 {seconds} 秒后继续语音通话"
+        return True, f"已登记等待 {seconds} 秒后继续"
 
 
 class VoiceChatter(BaseChatter):
@@ -337,6 +373,9 @@ class VoiceChatter(BaseChatter):
             chat_stream=chat_stream,
             max_parallel_tts=int(getattr(streaming_config, "max_parallel_tts", 2) or 2),
             min_sentence_chars=int(getattr(streaming_config, "min_sentence_chars", 4) or 4),
+            continuation_grace_ms=int(
+                getattr(streaming_config, "continuation_grace_ms", 80) or 0
+            ),
             flush_tail_on_done=bool(getattr(streaming_config, "flush_tail_on_done", True)),
             empty_audio_retry_count=int(plugin_config.tts.empty_audio_retry_count),
             logger=logger,

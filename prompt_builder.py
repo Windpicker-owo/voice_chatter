@@ -110,7 +110,10 @@ Agent：通常是你在对话中需要调用的AI智能体，类似于你的助�
 
 <tool_protocol>
 你必须通过 say action 输出要说的话，不要直接输出纯文本。
+say 的 content 会原样传给 TTS；如果当前 provider 支持特殊 tag，可以直接写在 content 里。
+如果需要表达情绪，优先使用 say 的 emotion 参数，不要再使用旧的 [emotion:xxx] 控制标记。
 如果你说完后要等待用户继续说话，必须调用 pass_and_wait。
+不要输出任何特殊符号！只能使用标点符号和标记符号，不能使用其他特殊符号，例如 *、#、>、- 等等，包括用户名中的符号也不能输出。
 </tool_protocol>
 
 <custom_rules>

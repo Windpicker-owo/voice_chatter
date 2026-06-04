@@ -1,24 +1,23 @@
-"""语音 Chatter 输出标记解析与句子切分。"""
+"""Speech segment helpers for voice_chatter."""
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
 
-_WAIT_RE = re.compile(r"\[wait\s*:\s*([0-9]+(?:\.[0-9]+)?)\]", re.IGNORECASE)
-_EMOTION_RE = re.compile(
-    r"\[emotion\s*:\s*([a-zA-Z0-9_\-]+)\](.*?)\[/emotion\]",
-    re.IGNORECASE | re.DOTALL,
-)
-_EMOTION_OPEN_RE = re.compile(r"\[emotion\s*:\s*([a-zA-Z0-9_\-]+)\]", re.IGNORECASE)
-_SENTENCE_END_RE = re.compile(r"(.+?(?:……|[。！？!?]|\n+))", re.DOTALL)
+_SENTENCE_END_RE = re.compile(r"(.+?(?:……|[。！？!?；;]|\n+))", re.DOTALL)
+_TAG_RE = re.compile(r"\[[^\[\]\r\n]+\]")
+_TAG_ONLY_RE = re.compile(r"(?:\[[^\[\]\r\n]+\]\s*)+")
+_DISALLOWED_PLAIN_CHARS = frozenset({"_", "\\", "`", "^", "|"})
+_CONTINUATION_PREFIX_CHARS = frozenset({"。", "！", "？", "!", "?", "；", ";", "：", ":", "，", ",", "、", "…"})
 
 
 @dataclass
 class SpeechSegment:
-    """单个待合成/播放的语音片段。"""
+    """A single spoken segment to synthesize and emit."""
 
     text: str
     wait_before: float = 0.0
@@ -26,113 +25,114 @@ class SpeechSegment:
     markers: dict[str, Any] = field(default_factory=dict)
 
 
-def parse_speech_segments(content: str, *, split_sentences: bool = True) -> list[SpeechSegment]:
-    """解析模型输出中的语音标记，并返回可播放片段。"""
+def sanitize_tts_text(text: str) -> str:
+    """Remove unsupported special characters while preserving complete tags."""
+
+    if not text:
+        return ""
+
+    cleaned_parts: list[str] = []
+    cursor = 0
+    for match in _TAG_RE.finditer(text):
+        cleaned_parts.append(_sanitize_plain_tts_text(text[cursor : match.start()]))
+        cleaned_parts.append(match.group(0))
+        cursor = match.end()
+
+    cleaned_parts.append(_sanitize_plain_tts_text(text[cursor:]))
+    return "".join(cleaned_parts).strip()
+
+
+def _sanitize_plain_tts_text(text: str) -> str:
+    kept: list[str] = []
+    for ch in text:
+        if ch in _DISALLOWED_PLAIN_CHARS:
+            continue
+        if ch in "\r\n\t ":
+            kept.append(ch)
+            continue
+
+        category = unicodedata.category(ch)
+        if category.startswith(("L", "N", "P")):
+            kept.append(ch)
+            continue
+        if category.startswith("Z"):
+            kept.append(" ")
+
+    return "".join(kept)
+
+
+def starts_with_continuation_punctuation(text: str) -> bool:
+    """Return True when the first non-tag char is continuation punctuation."""
+
+    probe = text.lstrip()
+    while probe:
+        match = _TAG_RE.match(probe)
+        if match is None:
+            break
+        probe = probe[match.end() :].lstrip()
+
+    return bool(probe) and probe[0] in _CONTINUATION_PREFIX_CHARS
+
+
+def is_tag_only_tts_text(text: str) -> bool:
+    """Return True when the sanitized text contains only complete tags."""
+
+    stripped = text.strip()
+    return bool(stripped) and _TAG_ONLY_RE.fullmatch(stripped) is not None
+
+
+def parse_speech_segments(
+    content: str,
+    *,
+    split_sentences: bool = True,
+    default_emotion: str | None = None,
+) -> list[SpeechSegment]:
+    """Split content into speech segments without parsing or stripping any tags."""
+
+    normalized_default_emotion = (default_emotion or "").strip() or None
+    chunks = split_complete_sentences(content) if split_sentences else [content]
+    markers = {"emotion": normalized_default_emotion} if normalized_default_emotion else {}
 
     segments: list[SpeechSegment] = []
-    pending_wait = 0.0
-    cursor = 0
-
-    for match in _EMOTION_RE.finditer(content):
-        prefix = content[cursor:match.start()]
-        pending_wait = _append_plain_segments(
-            segments,
-            prefix,
-            pending_wait=pending_wait,
-            split_sentences=split_sentences,
-            emotion=None,
-        )
-        emotion = match.group(1).strip() or None
-        pending_wait = _append_plain_segments(
-            segments,
-            match.group(2),
-            pending_wait=pending_wait,
-            split_sentences=split_sentences,
-            emotion=emotion,
-        )
-        cursor = match.end()
-
-    tail = _EMOTION_OPEN_RE.sub("", content[cursor:])
-    _append_plain_segments(
-        segments,
-        tail,
-        pending_wait=pending_wait,
-        split_sentences=split_sentences,
-        emotion=None,
-    )
-    return [segment for segment in segments if segment.text.strip()]
-
-
-def _append_plain_segments(
-    segments: list[SpeechSegment],
-    text: str,
-    *,
-    pending_wait: float,
-    split_sentences: bool,
-    emotion: str | None,
-) -> float:
-    """解析 wait 标记并追加普通文本片段，返回尚未消耗的等待时间。"""
-
-    cursor = 0
-    current_wait = pending_wait
-    for match in _WAIT_RE.finditer(text):
-        current_wait = _append_text_chunks(
-            segments,
-            text[cursor:match.start()],
-            wait_before=current_wait,
-            split_sentences=split_sentences,
-            emotion=emotion,
-        )
-        try:
-            current_wait = float(match.group(1))
-        except ValueError:
-            current_wait = 0.0
-        cursor = match.end()
-
-    return _append_text_chunks(
-        segments,
-        text[cursor:],
-        wait_before=current_wait,
-        split_sentences=split_sentences,
-        emotion=emotion,
-    )
-
-
-def _append_text_chunks(
-    segments: list[SpeechSegment],
-    text: str,
-    *,
-    wait_before: float,
-    split_sentences: bool,
-    emotion: str | None,
-) -> float:
-    """按句切分文本并追加片段，返回未被消费的等待时间。"""
-
-    chunks = split_complete_sentences(text) if split_sentences else [text]
-    current_wait = wait_before
+    pending_prefix_tags = ""
     for chunk in chunks:
         clean = chunk.strip()
         if not clean:
             continue
-        markers: dict[str, Any] = {}
-        if emotion:
-            markers["emotion"] = emotion
-        if current_wait > 0:
-            markers["wait_before"] = current_wait
+        if _TAG_ONLY_RE.fullmatch(clean):
+            if segments:
+                segments[-1].text = f"{segments[-1].text}{clean}"
+            else:
+                pending_prefix_tags = f"{pending_prefix_tags}{clean}"
+            continue
+
+        if pending_prefix_tags:
+            clean = f"{pending_prefix_tags}{clean}"
+            pending_prefix_tags = ""
+
+        clean = sanitize_tts_text(clean)
+        if not clean:
+            continue
+        if segments and starts_with_continuation_punctuation(clean):
+            segments[-1].text = f"{segments[-1].text}{clean}"
+            continue
+
         segments.append(
             SpeechSegment(
                 text=clean,
-                wait_before=current_wait,
-                emotion=emotion,
-                markers=markers,
+                wait_before=0.0,
+                emotion=normalized_default_emotion,
+                markers=dict(markers),
             )
         )
-        current_wait = 0.0
-    return current_wait
+
+    if pending_prefix_tags and segments:
+        segments[-1].text = f"{segments[-1].text}{pending_prefix_tags}"
+    return segments
 
 
 def split_complete_sentences(text: str) -> list[str]:
-    """按完整句子边界切分文本，保留句末标点。"""
+    """Split text on sentence boundaries while preserving punctuation."""
 
     stripped = text.strip()
     if not stripped:
@@ -152,4 +152,11 @@ def split_complete_sentences(text: str) -> list[str]:
     return chunks
 
 
-__all__ = ["SpeechSegment", "parse_speech_segments", "split_complete_sentences"]
+__all__ = [
+    "is_tag_only_tts_text",
+    "SpeechSegment",
+    "parse_speech_segments",
+    "sanitize_tts_text",
+    "split_complete_sentences",
+    "starts_with_continuation_punctuation",
+]

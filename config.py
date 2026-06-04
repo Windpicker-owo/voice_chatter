@@ -1,4 +1,4 @@
-"""语音 Chatter 配置。"""
+"""Configuration for the voice_chatter plugin."""
 
 from __future__ import annotations
 
@@ -8,51 +8,82 @@ from src.core.components.base.config import BaseConfig, Field, SectionBase, conf
 
 
 class VoiceChatterConfig(BaseConfig):
-    """语音 Chatter 配置。"""
+    """Runtime configuration for voice_chatter."""
 
     config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = "语音 Chatter 配置"
+    config_description: ClassVar[str] = "Voice chatter configuration"
 
-    @config_section("plugin", title="插件设置", tag="plugin")
+    @config_section("plugin", title="Plugin", tag="plugin")
     class PluginSection(SectionBase):
-        """插件基础配置。"""
-
-        enabled: bool = Field(default=True, description="是否启用语音 Chatter")
-        tick_interval: float = Field(default=1.0, description="该语音聊天流的 Tick 间隔")
-        allow_message_buffer: bool = Field(default=False, description="是否允许消息缓冲")
-        plain_text_retry_limit: int = Field(default=1, description="模型返回纯文本时的提醒重试次数")
+        enabled: bool = Field(default=True, description="Enable voice_chatter")
+        tick_interval: float = Field(default=1.0, description="Tick interval for the chat stream")
+        allow_message_buffer: bool = Field(
+            default=False,
+            description="Allow message buffering on the stream",
+        )
+        plain_text_retry_limit: int = Field(
+            default=1,
+            description="Retry count when the model answers with plain text instead of say action",
+        )
         enable_action_suspend: bool = Field(
             default=True,
-            description="是否启用纯 Action 回合的挂起机制。关闭后，纯 Action 结果会像常规工具结果一样继续 follow-up，而不是立即等待用户。",
+            description=(
+                "Enable suspend behavior for pure-action turns. When disabled, pure action "
+                "results continue follow-up like normal tool results."
+            ),
         )
 
-    @config_section("tts", title="TTS 设置", tag="tts")
+    @config_section("tts", title="TTS", tag="tts")
     class TTSSection(SectionBase):
-        """TTS 后端配置。"""
-
         endpoint: str = Field(
             default="http://127.0.0.1:8000/router/tts_http_server/api/tts/v1/synthesize",
-            description="TTS HTTP 合成接口地址",
+            description="TTS HTTP synthesize endpoint",
         )
-        timeout: float = Field(default=30.0, description="TTS HTTP 请求超时时间")
-        max_parallel_segments: int = Field(default=4, description="最大并行合成句子数")
-        empty_audio_retry_count: int = Field(default=1, description="TTS 返回空音频时的重试次数")
-        sentence_split_enabled: bool = Field(default=True, description="是否按句切分并并行合成")
-        mime_type: str = Field(default="audio/wav", description="TTS 音频 MIME 类型")
-        provider: str = Field(default="qwen_tts", description="TTS provider 名称，留空则使用服务端默认 provider")
-        emit_text_on_tts_failure: bool = Field(default=False, description="TTS 失败时是否回退发送文本")
+        timeout: float = Field(default=30.0, description="TTS HTTP request timeout")
+        max_parallel_segments: int = Field(
+            default=4,
+            description="Max parallel synthesized segments",
+        )
+        empty_audio_retry_count: int = Field(
+            default=1,
+            description="Retry count when TTS returns empty audio",
+        )
+        sentence_split_enabled: bool = Field(
+            default=True,
+            description="Split text into sentences before TTS",
+        )
+        mime_type: str = Field(default="audio/wav", description="TTS audio MIME type")
+        provider: str = Field(
+            default="qwen_tts",
+            description="TTS provider name; empty means use server default",
+        )
+        emit_text_on_tts_failure: bool = Field(
+            default=False,
+            description="Fallback to sending text when TTS fails",
+        )
 
     @config_section("low_latency_streaming", title="Streaming", tag="low_latency_streaming")
     class LowLatencyStreamingSection(SectionBase):
-        """低延迟流式 TTS 设置。"""
-
-        enabled: bool = Field(default=False, description="是否启用低延迟流式 TTS")
-        max_parallel_tts: int = Field(default=2, description="流式模式下的最大并行 TTS 任务数")
-        min_sentence_chars: int = Field(default=4, description="提交流式 TTS 前的最小句子长度")
-        flush_tail_on_done: bool = Field(default=True, description="工具调用流结束时是否刷新未完成的文本尾部")
+        enabled: bool = Field(default=False, description="Enable low-latency streaming TTS")
+        max_parallel_tts: int = Field(
+            default=2,
+            description="Max parallel TTS tasks in streaming mode",
+        )
+        min_sentence_chars: int = Field(
+            default=4,
+            description="Minimum sentence length before submitting streaming TTS",
+        )
+        continuation_grace_ms: int = Field(
+            default=80,
+            description="Lookahead window for continuation punctuation before flushing a sentence",
+        )
+        flush_tail_on_done: bool = Field(
+            default=True,
+            description="Flush incomplete tail text when the tool-call stream ends",
+        )
         require_native_tool_calling: bool = Field(
             default=True,
-            description="是否需要原生工具调用支持；tool_call_compat 会自动回退",
+            description="Require native tool calling support; tool_call_compat falls back automatically",
         )
 
     plugin: PluginSection = Field(default_factory=PluginSection)
