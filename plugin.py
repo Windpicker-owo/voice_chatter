@@ -64,6 +64,7 @@ class SayAction(BaseAction):
     )
     chatter_allow = ["voice_chatter"]
     associated_platforms = ["local_asr", "bilibili_live"]
+    associated_types = ["voice"]
     dependencies = ["asr_adapter:adapter:asr_adapter"]
 
     async def execute(
@@ -163,6 +164,7 @@ class VoicePassAndWaitAction(BaseAction):
     )
     chatter_allow = ["voice_chatter"]
     associated_platforms = ["local_asr", "bilibili_live"]
+    associated_types = ["voice"]
 
     async def execute(
         self,
